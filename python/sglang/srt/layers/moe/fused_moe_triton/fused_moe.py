@@ -393,6 +393,30 @@ def fused_experts_impl(
     )
 
     config, (down_config, max_block_m) = get_config_func(M)
+
+    # When no GEMM2-specific config exists and TMA is supported,
+    # enable TMA for B weight loading only (not A) with optimized config
+    # for small-K down projection (e.g. Qwen3.5 GEMM2 K=256).
+    # Set SGLANG_MOE_TMA_B=0 to disable this optimization.
+    _gemm2_use_tma_b_only = False
+    if (
+        down_config is None
+        and _down_moe_use_tma()
+        and bool(int(os.getenv("SGLANG_MOE_TMA_B", "1")))
+    ):
+        K_gemm2 = w2.shape[2] - padded_size
+        if K_gemm2 <= 512:
+            down_config = {
+                "BLOCK_SIZE_M": config["BLOCK_SIZE_M"],
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+                "GROUP_SIZE_M": 8,
+                "num_stages": 3,
+                "num_warps": 8,
+            }
+            _gemm2_use_tma_b_only = True
+            max_block_m = config["BLOCK_SIZE_M"]
+
     down_moe_use_tma = (
         _down_moe_use_tma()
         and down_config is not None
@@ -615,8 +639,8 @@ def fused_experts_impl(
             use_int4_w4a16=use_int4_w4a16,
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
-            a_use_tma=down_moe_use_tma,
-            b_use_tma=down_moe_use_tma,
+            a_use_tma=down_moe_use_tma and not _gemm2_use_tma_b_only,
+            b_use_tma=down_moe_use_tma or _gemm2_use_tma_b_only,
             filter_expert=filter_expert,
             fuse_sum_all_reduce=use_fused_moe_sum_all_reduce,
             router_topk=curr_topk_ids.shape[1],
