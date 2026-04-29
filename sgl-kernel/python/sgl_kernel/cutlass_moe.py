@@ -110,3 +110,80 @@ def cutlass_w4a8_moe_mm(
         chunk_size,
         topk,
     )
+
+
+def cutlass_w4a8_moe_gemv(
+    d: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    n_per_expert: torch.Tensor,
+    work_table: torch.Tensor,
+    tile_counter: torch.Tensor,
+    metadata: torch.Tensor,
+    M: int,
+    K: int,
+    num_experts: int,
+    metadata_offset: int,
+    persistent_grid_size: int,
+):
+    """
+    Persistent GEMV launch for W4A8 MoE decode.
+    CUDA Graph compatible: all dynamic values read from device pointers.
+    """
+    torch.ops.sgl_kernel.cutlass_w4a8_moe_gemv.default(
+        d, a, b, a_scale, b_scale, expert_offsets, n_per_expert,
+        work_table, tile_counter, metadata,
+        M, K, num_experts, metadata_offset, persistent_grid_size,
+    )
+
+
+def cutlass_w4a8_moe_preprocess_weights(
+    w_out: torch.Tensor,
+    s_out: torch.Tensor,
+    w_in: torch.Tensor,
+    s_in: torch.Tensor,
+    M: int,
+    K: int,
+):
+    """
+    Weight preprocessing: int4 nibble interleave + 2-row interleave + scale padding.
+    Called once at model load time.
+    """
+    torch.ops.sgl_kernel.cutlass_w4a8_moe_preprocess_weights.default(
+        w_out, s_out, w_in, s_in, M, K,
+    )
+
+
+def get_cutlass_w4a8_moe_mm_data_with_worktable(
+    topk_ids: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    problem_sizes1: torch.Tensor,
+    problem_sizes2: torch.Tensor,
+    n_per_expert: torch.Tensor,
+    work_table1: torch.Tensor,
+    work_table2: torch.Tensor,
+    metadata: torch.Tensor,
+    tile_counter1: torch.Tensor,
+    tile_counter2: torch.Tensor,
+    input_permutation: torch.Tensor,
+    output_permutation: torch.Tensor,
+    num_experts: int,
+    n: int,
+    k: int,
+    M_tiles1: int,
+    M_tiles2: int,
+):
+    """
+    Fused: compute problem sizes + expert offsets + build double work_table
+    for GEMV1 and GEMV2 in a single kernel pass.
+    """
+    torch.ops.sgl_kernel.get_cutlass_w4a8_moe_mm_data_with_worktable.default(
+        topk_ids, expert_offsets, problem_sizes1, problem_sizes2,
+        n_per_expert, work_table1, work_table2, metadata,
+        tile_counter1, tile_counter2,
+        input_permutation, output_permutation,
+        num_experts, n, k, M_tiles1, M_tiles2,
+    )

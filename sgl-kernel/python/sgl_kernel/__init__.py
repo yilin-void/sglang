@@ -16,7 +16,13 @@ from sgl_kernel.attention import (
     cutlass_mla_get_workspace_size,
     merge_state_v2,
 )
-from sgl_kernel.cutlass_moe import cutlass_w4a8_moe_mm, get_cutlass_w4a8_moe_mm_data
+from sgl_kernel.cutlass_moe import (
+    cutlass_w4a8_moe_gemv,
+    cutlass_w4a8_moe_mm,
+    cutlass_w4a8_moe_preprocess_weights,
+    get_cutlass_w4a8_moe_mm_data,
+    get_cutlass_w4a8_moe_mm_data_with_worktable,
+)
 from sgl_kernel.elementwise import (
     concat_mla_absorb_q,
     concat_mla_k,

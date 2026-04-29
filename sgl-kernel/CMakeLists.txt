@@ -136,7 +136,7 @@ set(SGL_KERNEL_CUDA_FLAGS
     "-O3"
     "-Xcompiler"
     "-fPIC"
-    "-gencode=arch=compute_90,code=sm_90"
+    # sm_90 base gencode skipped when SGL_KERNEL_SM90A_ONLY is set
     "-std=c++17"
     "-DFLASHINFER_ENABLE_F16"
     "-DCUTE_USE_PACKED_TUPLE=1"
@@ -216,37 +216,45 @@ if (ENABLE_BELOW_SM90)
 
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
-    list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-gencode=arch=compute_100a,code=sm_100a"
-        "-gencode=arch=compute_120a,code=sm_120a"
-    )
-    # refer sm_121, sm_110 and sm_101 description  https://github.com/pytorch/pytorch/pull/156176
-    if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
-        list(APPEND SGL_KERNEL_CUDA_FLAGS
-            "-gencode=arch=compute_103a,code=sm_103a"
-            "--compress-mode=size"
-        )
-        if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
-            list(APPEND SGL_KERNEL_CUDA_FLAGS
-                "-gencode=arch=compute_110a,code=sm_110a"
-                "-gencode=arch=compute_121a,code=sm_121a"
-            )
-        endif()
-    else()
-        if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
-            list(APPEND SGL_KERNEL_CUDA_FLAGS
-                "-gencode=arch=compute_101a,code=sm_101a"
-            )
-        endif()
-    endif()
-endif()
-
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
+if (DEFINED ENV{SGL_KERNEL_SM90A_ONLY})
+    message(STATUS "SGL_KERNEL_SM90A_ONLY: only compiling for sm_90a")
     set(SGL_KERNEL_ENABLE_FA3 ON)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_90a,code=sm_90a"
     )
+else()
+    if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
+        list(APPEND SGL_KERNEL_CUDA_FLAGS
+            "-gencode=arch=compute_100a,code=sm_100a"
+            "-gencode=arch=compute_120a,code=sm_120a"
+        )
+        # refer sm_121, sm_110 and sm_101 description  https://github.com/pytorch/pytorch/pull/156176
+        if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
+            list(APPEND SGL_KERNEL_CUDA_FLAGS
+                "-gencode=arch=compute_103a,code=sm_103a"
+                "--compress-mode=size"
+            )
+            if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+                list(APPEND SGL_KERNEL_CUDA_FLAGS
+                    "-gencode=arch=compute_110a,code=sm_110a"
+                    "-gencode=arch=compute_121a,code=sm_121a"
+                )
+            endif()
+        else()
+            if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
+                list(APPEND SGL_KERNEL_CUDA_FLAGS
+                    "-gencode=arch=compute_101a,code=sm_101a"
+                )
+            endif()
+        endif()
+    endif()
+
+    if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
+        set(SGL_KERNEL_ENABLE_FA3 ON)
+        list(APPEND SGL_KERNEL_CUDA_FLAGS
+            "-gencode=arch=compute_90a,code=sm_90a"
+        )
+    endif()
 endif()
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_FP4)
@@ -298,6 +306,7 @@ set(SOURCES
     "csrc/moe/cutlass_moe/w4a8/scaled_mm_entry.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_moe_data.cu"
     "csrc/moe/cutlass_moe/w4a8/w4a8_grouped_mm_c3x.cu"
+    "csrc/moe/cutlass_moe/w4a8/w4a8_gemv.cu"
     "csrc/moe/moe_align_kernel.cu"
     "csrc/moe/moe_fused_gate.cu"
     "csrc/moe/fused_qknorm_rope_kernel.cu"

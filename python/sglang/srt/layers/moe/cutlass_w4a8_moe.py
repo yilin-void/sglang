@@ -12,14 +12,13 @@ _is_cuda_alike = is_cuda_alike()
 
 if _is_cuda_alike:
     from sgl_kernel import (
+        cutlass_w4a8_moe_gemv,
         cutlass_w4a8_moe_mm,
         get_cutlass_w4a8_moe_mm_data,
+        get_cutlass_w4a8_moe_mm_data_with_worktable,
     )
 
-if _is_cuda:
-    from sglang.jit_kernel.activation import silu_and_mul
-else:
-    from sgl_kernel import silu_and_mul
+from sgl_kernel import silu_and_mul
 
 from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
 from sglang.srt.distributed import get_moe_expert_parallel_world_size
@@ -29,7 +28,6 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     deepep_permute_triton_kernel,
     deepep_post_reorder_triton_kernel,
     deepep_run_moe_deep_preprocess,
-    fp8_per_token_to_per_tensor_quant_triton,
     post_reorder_for_cutlass_moe,
     pre_reorder_for_cutlass_moe,
     silu_and_mul_masked_post_per_tensor_quant_fwd,
@@ -507,6 +505,7 @@ def cutlass_w4a8_moe_deepep_ll(
     )
 
     gateup_input = torch.empty(a_states.shape, dtype=torch.float8_e4m3fn, device=device)
+    from sglang.srt.layers.moe.ep_moe.kernels import fp8_per_token_to_per_tensor_quant_triton  # noqa: F811
     fp8_per_token_to_per_tensor_quant_triton(
         x=a_states,
         x_scale=a_scales,
@@ -556,3 +555,113 @@ def cutlass_w4a8_moe_deepep_ll(
     )
 
     return c2
+
+
+def cutlass_w4a8_moe_gemv_decode(
+    a: torch.Tensor,
+    w1_q: torch.Tensor,
+    w2_q: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    problem_sizes1: torch.Tensor,
+    problem_sizes2: torch.Tensor,
+    n_per_expert: torch.Tensor,
+    work_table1: torch.Tensor,
+    work_table2: torch.Tensor,
+    metadata: torch.Tensor,
+    tile_counter1: torch.Tensor,
+    tile_counter2: torch.Tensor,
+    a1_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+    persistent_grid_size: int = 0,
+    routed_scaling_factor: float = 1.0,
+) -> torch.Tensor:
+    """
+    W4A8 MoE decode using persistent GEMV kernels.
+    Reuses the existing permutation/SiLU pipeline, replaces grouped GEMM with GEMV.
+    All work_table/metadata/tile_counter tensors are pre-allocated and reused across calls.
+    CUDA Graph compatible.
+    """
+    assert w1_q.dtype == torch.int8
+    assert w2_q.dtype == torch.int8
+
+    num_local_experts = w1_q.size(0)
+    m = a.size(0)
+    k = w1_q.size(2) * 2  # hidden_size (packed int4)
+    n = w2_q.size(2) * 2  # intermediate_size_per_partition (packed int4)
+    topk = topk_ids.size(1)
+    device = a.device
+
+    # GEMV dimensions
+    M_gemv1 = w1_q.size(1)  # 2 * intermediate_size_per_partition
+    K_gemv1 = k              # hidden_size
+    M_gemv2 = w2_q.size(1)  # hidden_size
+    K_gemv2 = n              # intermediate_size_per_partition
+
+    # M_tiles = (M/4 + block_y - 1) / block_y, block_y = 128/8 = 16
+    M_tiles1 = (M_gemv1 // 4 + 15) // 16
+    M_tiles2 = (M_gemv2 // 4 + 15) // 16
+
+    if get_moe_expert_parallel_world_size() > 1:
+        topk_ids = torch.where(topk_ids == -1, num_local_experts, topk_ids)
+
+    # Step 1: src2dst permutation (reuse existing)
+    src2dst = cutlass_w4_run_moe_ep_preproess(topk_ids)
+
+    # Step 2: pre_reorder + FP8 quant (reuse existing)
+    gateup_input = torch.empty(
+        (m * topk, k), device=device, dtype=torch.float8_e4m3fn
+    )
+    pre_reorder_for_cutlass_moe(
+        a, gateup_input, src2dst, topk_ids, a1_scale,
+        num_local_experts, topk, m, k,
+    )
+
+    # Step 3: fused get_moe_data + build both work_tables (single kernel)
+    a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+    c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+    get_cutlass_w4a8_moe_mm_data_with_worktable(
+        topk_ids, expert_offsets, problem_sizes1, problem_sizes2,
+        n_per_expert, work_table1, work_table2, metadata,
+        tile_counter1, tile_counter2, a_map, c_map,
+        num_local_experts, n, k, M_tiles1, M_tiles2,
+    )
+
+    # Step 4: GEMV1 persistent (gate+up projection)
+    c1 = torch.empty((m * topk, M_gemv1), device=device, dtype=torch.bfloat16)
+    cutlass_w4a8_moe_gemv(
+        c1, gateup_input, w1_q, a1_scale.float(), w1_scale,
+        expert_offsets, n_per_expert, work_table1, tile_counter1, metadata,
+        M_gemv1, K_gemv1, num_local_experts,
+        1,  # metadata_offset=1 for GEMV1
+        persistent_grid_size,
+    )
+
+    # Step 5: SiLU + quant (reuse existing)
+    intermediate_q = torch.empty(
+        (m * topk, n), dtype=torch.float8_e4m3fn, device=device
+    )
+    silu_mul_static_tensorwise_quant_for_cutlass_moe(
+        c1, intermediate_q, a2_scale.float(), expert_offsets[-1:], m * topk, n
+    )
+
+    # Step 6: GEMV2 persistent (down projection)
+    c2 = torch.empty((m * topk, M_gemv2), device=device, dtype=torch.bfloat16)
+    cutlass_w4a8_moe_gemv(
+        c2, intermediate_q, w2_q, a2_scale.float(), w2_scale,
+        expert_offsets, n_per_expert, work_table2, tile_counter2, metadata,
+        M_gemv2, K_gemv2, num_local_experts,
+        2,  # metadata_offset=2 for GEMV2
+        persistent_grid_size,
+    )
+
+    # Step 7: post_reorder (reuse existing)
+    output = torch.empty_like(a)
+    post_reorder_for_cutlass_moe(
+        c2, output, src2dst, topk_ids, topk_weights,
+        num_local_experts, topk, m, k, routed_scaling_factor,
+    )
+    return output

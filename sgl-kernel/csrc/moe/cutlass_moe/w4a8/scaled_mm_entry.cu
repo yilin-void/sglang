@@ -36,6 +36,50 @@ void get_cutlass_w4a8_moe_mm_data_caller(
     const int64_t n,
     const int64_t k);
 
+void cutlass_w4a8_moe_gemv_sm90(
+    torch::Tensor& d,
+    torch::Tensor const& a,
+    torch::Tensor const& b,
+    torch::Tensor const& a_scale,
+    torch::Tensor const& b_scale,
+    torch::Tensor const& expert_offsets,
+    torch::Tensor const& n_per_expert,
+    torch::Tensor const& work_table,
+    torch::Tensor& tile_counter,
+    torch::Tensor const& metadata,
+    int64_t M,
+    int64_t K,
+    int64_t num_experts,
+    int64_t metadata_offset,
+    int64_t persistent_grid_size);
+
+void cutlass_w4a8_moe_preprocess_weights_sm90(
+    torch::Tensor& w_out,
+    torch::Tensor& s_out,
+    torch::Tensor const& w_in,
+    torch::Tensor const& s_in,
+    int64_t M,
+    int64_t K);
+
+void get_cutlass_w4a8_moe_mm_data_with_worktable_caller(
+    const torch::Tensor& topk_ids,
+    torch::Tensor& expert_offsets,
+    torch::Tensor& problem_sizes1,
+    torch::Tensor& problem_sizes2,
+    torch::Tensor& n_per_expert,
+    torch::Tensor& work_table1,
+    torch::Tensor& work_table2,
+    torch::Tensor& metadata,
+    torch::Tensor& tile_counter1,
+    torch::Tensor& tile_counter2,
+    torch::Tensor& input_permutation,
+    torch::Tensor& output_permutation,
+    const int64_t num_experts,
+    const int64_t n,
+    const int64_t k,
+    const int64_t M_tiles1,
+    const int64_t M_tiles2);
+
 void cutlass_w4a8_moe_mm(
     torch::Tensor& d_tensors,
     torch::Tensor const& a_tensors,
@@ -88,4 +132,61 @@ void get_cutlass_w4a8_moe_mm_data(
       n,
       k);
   return;
+}
+
+void cutlass_w4a8_moe_gemv(
+    torch::Tensor& d,
+    torch::Tensor const& a,
+    torch::Tensor const& b,
+    torch::Tensor const& a_scale,
+    torch::Tensor const& b_scale,
+    torch::Tensor const& expert_offsets,
+    torch::Tensor const& n_per_expert,
+    torch::Tensor const& work_table,
+    torch::Tensor& tile_counter,
+    torch::Tensor const& metadata,
+    int64_t M,
+    int64_t K,
+    int64_t num_experts,
+    int64_t metadata_offset,
+    int64_t persistent_grid_size) {
+  cutlass_w4a8_moe_gemv_sm90(
+      d, a, b, a_scale, b_scale, expert_offsets, n_per_expert,
+      work_table, tile_counter, metadata,
+      M, K, num_experts, metadata_offset, persistent_grid_size);
+}
+
+void cutlass_w4a8_moe_preprocess_weights(
+    torch::Tensor& w_out,
+    torch::Tensor& s_out,
+    torch::Tensor const& w_in,
+    torch::Tensor const& s_in,
+    int64_t M,
+    int64_t K) {
+  cutlass_w4a8_moe_preprocess_weights_sm90(w_out, s_out, w_in, s_in, M, K);
+}
+
+void get_cutlass_w4a8_moe_mm_data_with_worktable(
+    const torch::Tensor& topk_ids,
+    torch::Tensor& expert_offsets,
+    torch::Tensor& problem_sizes1,
+    torch::Tensor& problem_sizes2,
+    torch::Tensor& n_per_expert,
+    torch::Tensor& work_table1,
+    torch::Tensor& work_table2,
+    torch::Tensor& metadata,
+    torch::Tensor& tile_counter1,
+    torch::Tensor& tile_counter2,
+    torch::Tensor& input_permutation,
+    torch::Tensor& output_permutation,
+    const int64_t num_experts,
+    const int64_t n,
+    const int64_t k,
+    const int64_t M_tiles1,
+    const int64_t M_tiles2) {
+  get_cutlass_w4a8_moe_mm_data_with_worktable_caller(
+      topk_ids, expert_offsets, problem_sizes1, problem_sizes2,
+      n_per_expert, work_table1, work_table2, metadata,
+      tile_counter1, tile_counter2, input_permutation, output_permutation,
+      num_experts, n, k, M_tiles1, M_tiles2);
 }

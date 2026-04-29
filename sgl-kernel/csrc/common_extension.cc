@@ -241,6 +241,30 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "               int chunk_size, int topk) -> ()");
   m.impl("cutlass_w4a8_moe_mm", torch::kCUDA, &cutlass_w4a8_moe_mm);
 
+  m.def(
+      "cutlass_w4a8_moe_gemv(Tensor! d, Tensor a, Tensor b, "
+      "               Tensor a_scale, Tensor b_scale, Tensor expert_offsets, "
+      "               Tensor n_per_expert, Tensor work_table, Tensor! tile_counter, "
+      "               Tensor metadata, int M, int K, int num_experts, "
+      "               int metadata_offset, int persistent_grid_size) -> ()");
+  m.impl("cutlass_w4a8_moe_gemv", torch::kCUDA, &cutlass_w4a8_moe_gemv);
+
+  m.def(
+      "cutlass_w4a8_moe_preprocess_weights(Tensor! w_out, Tensor! s_out, "
+      "               Tensor w_in, Tensor s_in, int M, int K) -> ()");
+  m.impl("cutlass_w4a8_moe_preprocess_weights", torch::kCUDA, &cutlass_w4a8_moe_preprocess_weights);
+
+  m.def(
+      "get_cutlass_w4a8_moe_mm_data_with_worktable("
+      "               Tensor topk_ids, Tensor! expert_offsets, "
+      "               Tensor! problem_sizes1, Tensor! problem_sizes2, "
+      "               Tensor! n_per_expert, Tensor! work_table1, Tensor! work_table2, "
+      "               Tensor! metadata, Tensor! tile_counter1, Tensor! tile_counter2, "
+      "               Tensor! input_permutation, Tensor! output_permutation, "
+      "               int num_experts, int n, int k, int M_tiles1, int M_tiles2) -> ()");
+  m.impl("get_cutlass_w4a8_moe_mm_data_with_worktable", torch::kCUDA,
+         &get_cutlass_w4a8_moe_mm_data_with_worktable);
+
   /*
    * From csrc/speculative
    */

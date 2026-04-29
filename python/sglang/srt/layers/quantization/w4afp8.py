@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
@@ -99,6 +100,11 @@ class W4AFp8Config(QuantizationConfig):
         if isinstance(layer, LinearBase):
             if is_layer_skipped(prefix, self.ignored_layers):
                 return UnquantizedLinearMethod()
+            # Skip FP8 for linear attention layers with incompatible dims
+            # (Qwen3.5 linear_attn in_proj_ba has partition_size not divisible by 128)
+            if any(s in prefix for s in ("in_proj_ba", "in_proj_qkvz", "linear_attn")):
+                logger.info(f"Skipping FP8 for layer {prefix} (linear_attn incompatible dims)")
+                return UnquantizedLinearMethod()
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             return W4AFp8MoEMethod(self)
@@ -128,6 +134,7 @@ def interleave_scales(scales: torch.Tensor) -> torch.Tensor:
 class W4AFp8MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: W4AFp8Config):
         self.quant_config = quant_config
+        self.use_gemv = getattr(quant_config, "use_gemv", False) or os.environ.get("SGLANG_W4A8_USE_GEMV", "0") == "1"
 
     def create_weights(
         self,
@@ -252,23 +259,33 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             (num_experts, 3), dtype=torch.int32, device=device
         )
 
+        # GEMV persistent state (allocated here, may be moved to GPU later)
+        if self.use_gemv:
+            self.n_per_expert = torch.empty(
+                num_experts, dtype=torch.int32, device=device
+            )
+            self.work_table1 = torch.empty(
+                num_experts * 3, dtype=torch.int32, device=device
+            )
+            self.work_table2 = torch.empty(
+                num_experts * 3, dtype=torch.int32, device=device
+            )
+            self.metadata = torch.empty(3, dtype=torch.int32, device=device)
+            self.tile_counter1 = torch.zeros(1, dtype=torch.int32, device=device)
+            self.tile_counter2 = torch.zeros(1, dtype=torch.int32, device=device)
+
         return
 
     def process_weights_after_loading(self, layer: Module) -> None:
         dtype = torch.bfloat16
         device = layer.w2_weight.device
 
-        # Interleave w13_weight_scale (gate_up_proj)
-        w13_weight_scale = layer.w13_weight_scale_inv.to(dtype)
-        w13_weight_scale = interleave_scales(w13_weight_scale)
-        layer.w13_weight_scale_inv = Parameter(w13_weight_scale, requires_grad=False)
+        if self.use_gemv:
+            self._process_weights_gemv(layer, dtype, device)
+        else:
+            self._process_weights_grouped_gemm(layer, dtype, device)
 
-        # Interleave w2_weight_scale (down_proj)
-        w2_weight_scale = layer.w2_weight_scale_inv.to(dtype)
-        w2_weight_scale = interleave_scales(w2_weight_scale)
-        layer.w2_weight_scale_inv = Parameter(w2_weight_scale, requires_grad=False)
-
-        # Process input scales
+        # Process input scales (shared by both paths)
         w13_input_scale_max = layer.w13_input_scale.max().to(torch.float32).item()
         new_w13_input_scale = torch.tensor(
             [w13_input_scale_max],
@@ -283,6 +300,64 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         )
         layer.w2_input_scale = Parameter(new_w2_input_scale, requires_grad=False)
 
+    def _process_weights_grouped_gemm(self, layer: Module, dtype, device) -> None:
+        # Interleave w13_weight_scale (gate_up_proj)
+        w13_weight_scale = layer.w13_weight_scale_inv.to(dtype)
+        w13_weight_scale = interleave_scales(w13_weight_scale)
+        layer.w13_weight_scale_inv = Parameter(w13_weight_scale, requires_grad=False)
+
+        # Interleave w2_weight_scale (down_proj)
+        w2_weight_scale = layer.w2_weight_scale_inv.to(dtype)
+        w2_weight_scale = interleave_scales(w2_weight_scale)
+        layer.w2_weight_scale_inv = Parameter(w2_weight_scale, requires_grad=False)
+
+    def _process_weights_gemv(self, layer: Module, dtype, device) -> None:
+        from sgl_kernel import cutlass_w4a8_moe_preprocess_weights
+
+        E = layer.w13_weight.size(0)
+
+        # --- GEMV1 weights: w13 [E, 2*inter, hidden/2] ---
+        M1 = layer.w13_weight.size(1)
+        K1 = layer.w13_weight.size(2) * 2
+        groups1 = K1 // self.quant_config.group_size
+        padded_groups1 = (groups1 + 7) // 8 * 8
+
+        w13_out = torch.empty_like(layer.w13_weight)
+        s13_out = torch.empty(E, M1, padded_groups1, dtype=dtype, device=device)
+        s13_in = layer.w13_weight_scale_inv.to(dtype)
+        cutlass_w4a8_moe_preprocess_weights(
+            w13_out, s13_out, layer.w13_weight.data, s13_in, M1, K1
+        )
+        layer.w13_weight = Parameter(w13_out, requires_grad=False)
+        layer.w13_weight_scale_inv = Parameter(s13_out, requires_grad=False)
+
+        # --- GEMV2 weights: w2 [E, hidden, inter/2] ---
+        M2 = layer.w2_weight.size(1)
+        K2 = layer.w2_weight.size(2) * 2
+        groups2 = K2 // self.quant_config.group_size
+        padded_groups2 = (groups2 + 7) // 8 * 8
+
+        w2_out = torch.empty_like(layer.w2_weight)
+        s2_out = torch.empty(E, M2, padded_groups2, dtype=dtype, device=device)
+        s2_in = layer.w2_weight_scale_inv.to(dtype)
+        cutlass_w4a8_moe_preprocess_weights(
+            w2_out, s2_out, layer.w2_weight.data, s2_in, M2, K2
+        )
+        layer.w2_weight = Parameter(w2_out, requires_grad=False)
+        layer.w2_weight_scale_inv = Parameter(s2_out, requires_grad=False)
+
+        # --- GEMV persistent state ---
+        sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+        self.persistent_grid_size = sm_count * 8
+
+        # Move GEMV state tensors to correct device
+        self.n_per_expert = self.n_per_expert.to(device)
+        self.work_table1 = self.work_table1.to(device)
+        self.work_table2 = self.work_table2.to(device)
+        self.metadata = self.metadata.to(device)
+        self.tile_counter1 = self.tile_counter1.to(device)
+        self.tile_counter2 = self.tile_counter2.to(device)
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -294,36 +369,65 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
 
-        from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         topk_weights, topk_ids, _ = topk_output
 
-        output = cutlass_w4a8_moe(
-            x,
-            layer.w13_weight,
-            layer.w2_weight,
-            layer.w13_weight_scale_inv,
-            layer.w2_weight_scale_inv,
-            topk_weights,
-            topk_ids,
-            self.a_strides1,
-            self.b_strides1,
-            self.c_strides1,
-            self.a_strides2,
-            self.b_strides2,
-            self.c_strides2,
-            self.s_strides13,
-            self.s_strides2,
-            self.expert_offsets,
-            self.problem_sizes1,
-            self.problem_sizes2,
-            layer.w13_input_scale,
-            layer.w2_input_scale,
-            routed_scaling_factor=self.moe_runner_config.routed_scaling_factor or 1.0,
-        )
+        if self.use_gemv:
+            from sglang.srt.layers.moe.cutlass_w4a8_moe import (
+                cutlass_w4a8_moe_gemv_decode,
+            )
+
+            output = cutlass_w4a8_moe_gemv_decode(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale_inv,
+                layer.w2_weight_scale_inv,
+                topk_weights,
+                topk_ids,
+                self.expert_offsets,
+                self.problem_sizes1,
+                self.problem_sizes2,
+                self.n_per_expert,
+                self.work_table1,
+                self.work_table2,
+                self.metadata,
+                self.tile_counter1,
+                self.tile_counter2,
+                layer.w13_input_scale,
+                layer.w2_input_scale,
+                persistent_grid_size=self.persistent_grid_size,
+                routed_scaling_factor=self.moe_runner_config.routed_scaling_factor or 1.0,
+            )
+        else:
+            from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
+
+            output = cutlass_w4a8_moe(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale_inv,
+                layer.w2_weight_scale_inv,
+                topk_weights,
+                topk_ids,
+                self.a_strides1,
+                self.b_strides1,
+                self.c_strides1,
+                self.a_strides2,
+                self.b_strides2,
+                self.c_strides2,
+                self.s_strides13,
+                self.s_strides2,
+                self.expert_offsets,
+                self.problem_sizes1,
+                self.problem_sizes2,
+                layer.w13_input_scale,
+                layer.w2_input_scale,
+                routed_scaling_factor=self.moe_runner_config.routed_scaling_factor or 1.0,
+            )
         return StandardCombineInput(hidden_states=output)
 
     def apply_deepep_ll(
