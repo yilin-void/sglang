@@ -136,11 +136,29 @@ void matrix_A_interleave_kernel(
           using ElementAccess = cutlass::Array<ElementA, kElementsPerAccess>;
 
           if constexpr (cutlass::sizeof_bits<ElementA>::value == 4) {
-            // INT4 x FP8: copy without nibble rearrangement.
-            // The GEMV kernel converts int4->fp16 before the MMA, so the
-            // int4-specific nibble interleave (designed for int4 MMA) is not needed.
-            // Only the 2-row interleave (M-dimension layout) is applied.
-            *reinterpret_cast<ElementAccess *>(A_interleaved) = *reinterpret_cast<ElementAccess *>(A);
+            // INT4 x FP8 — restore the per-uint32 int4 nibble interleave
+            // {0,4,1,5,2,6,3,7} that Shao's CUTLASS branch performs in its
+            // matrix_A_interleave. The V2 GEMV kernel body reads packed
+            // bytes assuming this rearrangement; an earlier "skip rearrange"
+            // simplification here was incorrect and caused V2 GEMV to
+            // disagree numerically with cutlass_w4a8_moe_mm (kernel-level
+            // cos ≈ 0.21 on synthetic random data; restored → 0.9999998).
+            const int num_uint32_t = cutlass::sizeof_bits<ElementAccess>::value / 32;
+            Array<uint32_t, num_uint32_t> results;
+            results.fill(0);
+
+            uint32_t *ptr = reinterpret_cast<uint32_t *>(A);
+            const int interleave_map[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+
+            for (int i = 0; i < num_uint32_t; i++) {
+              uint32_t value = ptr[i];
+              for (int j = 0; j < 8; j++) {
+                uint32_t int4_value = (value >> (j * 4)) & 0xF;
+                results[i] |= (int4_value << (interleave_map[j] * 4));
+              }
+            }
+
+            *reinterpret_cast<ElementAccess *>(A_interleaved) = *reinterpret_cast<ElementAccess *>(&results);
 
             if (k % kSFVecSize == 0) {
               int SFsPerRow = K / kSFVecSize;

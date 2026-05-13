@@ -390,11 +390,24 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # Qwen3.5 has separate in_proj_b and in_proj_a weights in the
         # checkpoint, which are loaded into the fused in_proj_ba parameter
         # via stacked_params_mapping with shard_id 0 and 1 respectively.
+        # Skip block quantization when output dims (num_v_heads) are smaller
+        # than the block size, as scales can't be split across merged shards
+        # (e.g., Qwen3.5-122B-A10B: num_v_heads=64 < block_n=128). Narrow
+        # workaround replacing the previous wide prefix-match in w4afp8.py —
+        # only bypasses FP8 for in_proj_ba and leaves in_proj_qkv/in_proj_z/
+        # out_proj on their ckpt-specified FP8_BLOCK_SCALES path.
+        ba_quant_config = quant_config
+        if (
+            quant_config is not None
+            and getattr(quant_config, "weight_block_size", None) is not None
+            and num_v_heads < quant_config.weight_block_size[0]
+        ):
+            ba_quant_config = None
         return MergedColumnParallelLinear(
             input_size=hidden_size,
             output_sizes=[num_v_heads, num_v_heads],
             bias=False,
-            quant_config=quant_config,
+            quant_config=ba_quant_config,
             prefix=prefix,
             tp_rank=tp_rank,
             tp_size=tp_size,

@@ -100,11 +100,6 @@ class W4AFp8Config(QuantizationConfig):
         if isinstance(layer, LinearBase):
             if is_layer_skipped(prefix, self.ignored_layers):
                 return UnquantizedLinearMethod()
-            # Skip FP8 for linear attention layers with incompatible dims
-            # (Qwen3.5 linear_attn in_proj_ba has partition_size not divisible by 128)
-            if any(s in prefix for s in ("in_proj_ba", "in_proj_qkvz", "linear_attn")):
-                logger.info(f"Skipping FP8 for layer {prefix} (linear_attn incompatible dims)")
-                return UnquantizedLinearMethod()
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             return W4AFp8MoEMethod(self)
