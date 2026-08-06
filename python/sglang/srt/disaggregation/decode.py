@@ -2186,6 +2186,19 @@ class SchedulerDisaggregationDecodeMixin:
         new_batch.prepare_for_prebuilt()
         new_batch.process_prebuilt(self.server_args, self.future_map)
 
+        if self.server_args.pp_size > 1 and not self.spec_algorithm.is_none():
+            # PP+spec normally seeds the first verify chain from the relayed
+            # result of a local prefill forward. A disaggregated decode worker
+            # starts from PREBUILT instead, so no such result exists. Every PP
+            # stage does have the transferred bonus token; use it to seed a
+            # degenerate first chain. The last stage's tail draft replaces it
+            # with a real chain after the first verify round.
+            assert new_batch.spec_info is not None
+            self._pp_spec_store_bonus(
+                new_batch,
+                new_batch.spec_info.bonus_tokens,
+            )
+
         return new_batch
 
     def process_decode_queue(self: Scheduler):
