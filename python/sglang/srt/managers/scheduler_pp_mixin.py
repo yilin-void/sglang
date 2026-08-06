@@ -1438,18 +1438,16 @@ class SchedulerPPMixin:
         batch_result = None
         send_output_work = []
 
-        # On CUDA, isend is async: it enqueues to the stream and returns,
-        # so every rank can send first safely. On some backends isend is
-        # effectively blocking and does not return until the peer posts a
-        # matching recv; if every PP rank sends first, all ranks block
-        # waiting for a receiver and the ring deadlocks. Order send/recv
-        # by pp_rank parity (even: send->recv, odd: recv->send) so each
-        # adjacent pair has one sender and one receiver posted at the
-        # same time.
-
-        # CUDA: send first
-        # XPU: even ranks send first, odd ranks recv first.
-        send_first = (not is_xpu()) or ((self.ps.pp_rank % 2) == 0)
+        # PP+spec relays several tensors whose shapes can differ across
+        # in-flight microbatches. Do not rely on CUDA isend being nonblocking
+        # for that case: recent PyTorch/NCCL versions lazily create a
+        # communicator for these unbatched P2P ops, and two ranks both entering
+        # send_tensor_dict first can deadlock. Pair rank 0's send with rank 1's
+        # recv before reversing the direction, as already required by XPU.
+        ordered_p2p = is_xpu() or (
+            not self.spec_algorithm.is_none() and self.ps.pp_size % 2 == 0
+        )
+        send_first = not ordered_p2p or (self.ps.pp_rank % 2) == 0
 
         def _do_send():
             return self._pp_send_output_to_next_stage(
